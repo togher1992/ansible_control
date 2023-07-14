@@ -5,131 +5,114 @@
  gather_facts: true
  
  tasks: 
-  - name: Generate a certificate using openssl
-    shell: |
-      cat > openssl.conf << EOL
-      distinguished_name = req_distinguished_name
-      [req_distinguished_name]
-      [v3_req_client]
-      extendedKeyUsage = clientAuth
-      subjectAltName = otherName:1.3.6.1.4.1.311.20.2.3;UTF8:ansible@localhost
-      EOL
-      export OPENSSL_CONF=openssl.conf
-      openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -out cert.pem -outform PEM -keyout cert_key.pem -subj "/CN=ansible" -extensions v3_req_client
-      rm openssl.conf
-      ssh-keygen -f cert_key.pem -y > cert_ssh.pub
-    args:
-      executable: /bin/bash
-    delegate_to: localhost
-
-  - name: Set Facts to Keys
-    set_fact:
-      public_key: "{{ lookup('file','./cert.pem') }}"
-      private_key: "{{ lookup('file','./cert_key.pem') }}"
-      ssh_public_key: "{{ lookup('file','./cert_ssh.pub') }}"
-    delegate_to: localhost
-
-  - name: Add new instance to host group
-    add_host:
-      hostname: "{{ server_ipaddress}}"
-      ansible_host: "{{ server_ipaddress }}"
-      ansible_connection: winrm
-      ansible_port: 5986
-      ansible_user: 'Administrator'
-      ansible_password: "Fishbulb1"
-      ansible_winrm_server_cert_validation: ignore
+ 
+   - name: Generate certificate
+     generate_certificate:
+       cert_file: '/runner/project/public_key.pem'
+       key_file: '/runner/project/private_key.pem'
+       pub_key_file: '/runner/project/ssh_public_key.pub'
+       common_name: 'ansible'
+     register: certificate_result
       
-  - name: Ensure Ansible user is present
-    ansible.windows.win_user:
-      name: ansible
-      password: Password123$
-      state: present
-      groups:
-        - Users
-    delegate_to: "{{ server_hostname }}"
+   - name: Grab to Var
+     set_fact:
+       public_key: "{{ lookup('file','/runner/project/public_key.pem') }}"
+       private_key: "{{ lookup('file','/runner/project/private_key.pem') }}"
+       ssh_public_key: "{{ lookup('file','/runner/project/ssh_public_key.pub') }}"
 
-  - name: Import Keys to Server
-    ansible.windows.win_powershell:
-      script: |
-        Set-Item -Path WSMan:\localhost\Service\Auth\Certificate -Value $true
-        Set-Content -Path 'C:\Windows\Temp\PubKey.pem' -Value '{{ public_key }}'
-        Set-Content -Path 'C:\Windows\Temp\PrivateKey.pem' -Value '{{ private_key }}'
-        Set-Content -Path 'C:\ProgramData\ssh\administrators_authorized_keys' -Value '{{ ssh_public_key }}'
-        $Key = 'C:\Windows\Temp\PubKey.pem'
-        $null = Import-Certificate -FilePath $Key -CertStoreLocation 'Cert:\LocalMachine\Root'
-        $null = Import-Certificate -FilePath $Key -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople'
-        
-        ## Find all HTTPS listners
-        $httpsListeners = Get-ChildItem -Path WSMan:\localhost\Listener\ | where-object { $_.Keys -match 'Transport=HTTPS' }
+   - name: Add new instance to host group
+     add_host:
+       hostname: "{{ server_ipaddress}}"
+       ansible_host: "{{ server_ipaddress }}"
+       ansible_connection: winrm
+       ansible_port: 5986
+       ansible_user: ''
+       ansible_password: ""
+       ansible_winrm_server_cert_validation: ignore
+      
+   - name: Ensure Ansible user is present
+     ansible.windows.win_user:
+       name: 
+       password: 
+       state: present
+       groups:
+         - Users
+     delegate_to: "{{ server_hostname }}"
 
-        ## If not listeners are defined at all or no listener is configured to work with
-        ## the server cert created, create a new one with a Subject of the computer's host name
-        ## and bound to the server certificate.
-        if ((-not $httpsListeners) -or -not (@($httpsListeners).where( { $_.CertificateThumbprint -ne $serverCert.Thumbprint }))) {
-            $newWsmanParams = @{
-                ResourceUri = 'winrm/config/Listener'
-                SelectorSet = @{ Transport = "HTTPS"; Address = "*" }
-                ValueSet    = @{ Hostname = $hostName; CertificateThumbprint = $serverCert.Thumbprint }
-                # UseSSL = $true
-            }
-            $null = New-WSManInstance @newWsmanParams
-        }
-        
-        if (-not (Get-PSSessionConfiguration) -or (-not (Get-ChildItem WSMan:\localhost\Listener))) {
-            Enable-PSRemoting -SkipNetworkProfileCheck -Force
-        }
-        
-        # Get the current Hostname
-        $hostname = hostname
+   - name: Import Keys to Server
+     ansible.windows.win_powershell:
+       script: |
+         Set-Item -Path WSMan:\localhost\Service\Auth\Certificate -Value $true
+         Set-Content -Path 'C:\Windows\Temp\PubKey.pem' -Value '{{ public_key }}'
+         Set-Content -Path 'C:\Windows\Temp\PrivateKey.pem' -Value '{{ private_key }}'
+         Set-Content -Path 'C:\ProgramData\ssh\administrators_authorized_keys' -Value '{{ ssh_public_key }}'
+         $Key = 'C:\Windows\Temp\PubKey.pem'
+         $null = Import-Certificate -FilePath $Key -CertStoreLocation 'Cert:\LocalMachine\Root'
+         $null = Import-Certificate -FilePath $Key -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople'
+         
+         # Get the current Hostname
+         $hostname = hostname 
 
-        # Generate the server cert
-        $serverCert = New-SelfSignedCertificate -DnsName $hostname -CertStoreLocation 'Cert:\LocalMachine\My'
-        
-        $username = "ansible"
-        $password = ConvertTo-SecureString -String "Password123$" -AsPlainText -Force
-        $credential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $username, $password
+         # Generate the server cert
+         $serverCert = New-SelfSignedCertificate -DnsName $hostname -CertStoreLocation 'Cert:\LocalMachine\My'
+         
+         ## Find all HTTPS listners
+         $httpsListeners = Get-ChildItem -Path WSMan:\localhost\Listener\ | where-object { $_.Keys -match 'Transport=HTTPS' }
+         
+         ## If not listeners are defined at all or no listener is configured to work with
+         ## the server cert created, create a new one with a Subject of the computer's host name
+         ## and bound to the server certificate.
+         if ((-not $httpsListeners) -or -not (@($httpsListeners).where( { $_.CertificateThumbprint -ne $serverCert.Thumbprint }))) {
+             $newWsmanParams = @{
+                 ResourceUri = 'winrm/config/Listener'
+                 SelectorSet = @{ Transport = "HTTPS"; Address = "*" }
+                 ValueSet    = @{ Hostname = $hostName; CertificateThumbprint = $serverCert.Thumbprint }
+                 # UseSSL = $true
+             }
+             $null = New-WSManInstance @newWsmanParams
+         }
+         
+         if (-not (Get-PSSessionConfiguration) -or (-not (Get-ChildItem WSMan:\localhost\Listener))) {
+             Enable-PSRemoting -SkipNetworkProfileCheck -Force
+         }
+         
+         $username = ""
+         $password = ConvertTo-SecureString -String "" -AsPlainText -Force
+         $credential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $username, $password 
 
-        # This is the issuer thumbprint which in the case of a self generated cert
-        # is the public key thumbprint, additional logic may be required for other
-        # scenarios
-        $thumbprint = (Get-ChildItem -Path cert:\LocalMachine\root | Where-Object { $_.Subject -eq "CN=$username" }).Thumbprint
-
-        New-Item -Path WSMan:\localhost\ClientCertificate `
-            -Subject "$username@localhost" `
-            -URI * `
-            -Issuer $thumbprint `
-            -Credential $credential `
-            -Force
-    delegate_to: "{{ server_hostname }}"
+         # This is the issuer thumbprint which in the case of a self generated cert
+         # is the public key thumbprint, additional logic may be required for other
+         # scenarios
+         $thumbprint = (Get-ChildItem -Path cert:\LocalMachine\root | Where-Object { $_.Subject -eq "CN=$username" }).Thumbprint
+ 
+         New-Item -Path WSMan:\localhost\ClientCertificate `
+             -Subject "$username@localhost" `
+             -URI * `
+             -Issuer $thumbprint `
+             -Credential $credential `
+             -Force
+     delegate_to: "{{ server_hostname }}"
     
-  - name: Add Ansible user to local admins
-    win_group_membership:
-      name: Administrators
-      members:
-        - ansible
-      state: present
-    delegate_to: "{{ server_hostname }}"
+   - name: Add Ansible user to local admins
+     win_group_membership:
+       name: Administrators
+       members:
+         - ansible
+       state: present
+     delegate_to: "{{ server_hostname }}"
         
-  - name: Add new instance to host group
-    add_host:
-      hostname: "{{ server_hostname }}"
-      ansible_host: "{{ server_ipaddress }}"
-      ansible_connection: psrp
-      ansible_port: 5986
-      ansible_psrp_cert_validation: ignore
-      ansible_psrp_certificate_pem: '/runner/project/cert.pem'
-      ansible_psrp_certificate_key_pem: '/runner/project/cert_key.pem'
-      ansible_psrp_auth: certificate
-  
-  - name: Template Keys to File
-    template:
-      src: "./templates/{{ item.src }}.j2"
-      dest: "{{ item.dest }}"
-      mode: '0400'
-    loop:
-      - { src: 'cert.pem', dest: '/runner/project/cert.pem' }
-      - { src: 'cert_key.pem', dest: '/runner/project/cert_key.pem' }
-
+   - name: Add new instance to host group
+     add_host:
+       hostname: "{{ server_hostname }}"
+       ansible_host: "{{ server_ipaddress }}"
+       ansible_connection: psrp
+       ansible_port: 5986
+       ansible_psrp_cert_validation: ignore
+       ansible_psrp_certificate_pem: '/runner/project/public_key.pem'
+       ansible_psrp_certificate_key_pem: '/runner/project/private_key.pem'
+       ansible_psrp_auth: certificate
+       ansible_user: ansible
+ 
 -
   name: "Execute : Run PSRP Configuration Playbook"
   hosts: "{{ server_hostname }}"
