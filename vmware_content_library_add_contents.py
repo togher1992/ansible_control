@@ -1,113 +1,189 @@
 #!/usr/bin/python
 
-from ansible.module_utils.basic import AnsibleModule
-from pyVim.connect import SmartConnect, Disconnect
-from pyVmomi import vim
-import ssl
+import json
 import requests
+import uuid
 import urllib3
+import time
+from collections import defaultdict
+from ansible.module_utils.basic import *
+from ansible.module_utils.vmware_rest_client import VmwareRestClient
+from ansible.module_utils._text import to_native
+from datetime import datetime
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+class VMwareContentLibraryManager(VmwareRestClient):
+    def __init__(self, module):
+        """Constructor."""
+        super(VMwareContentLibraryManager, self).__init__(module)
+        self.hostname = self.params.get('hostname')
+        self.content_library = self.params.get('content_library')
+        self.vm_name = self.params.get('vm_name')
+        self.validate_certs = self.params.get('validate_certs')
+        self.username = self.params.get('username')
+        self.password = self.params.get('password')
+        self.esxi_host = self.params.get('esxi_host')
+        self.vm_notes = self.params.get('vm_notes')
+        self.port = self.params.get('port')
 
-def add_content_library(module):
-    # Get module parameters
-    source_library_name = module.params.get('source_library_name')
-    destination_library_name = module.params.get('destination_library_name')
-    vcenter_host = module.params.get('vcenter_host')
-    vcenter_user = module.params.get('vcenter_user')
-    vcenter_password = module.params.get('vcenter_password')
-    validate_certs = module.params.get('validate_certs')
+        # Session management
+        self.session = self.get_vcenter_session()
 
-    try:
-        # Disable SSL certificate verification
-        context = None
-        if not validate_certs:
-            context = create_ssl_context()
+    def api_call(self, url, method='get', headers=None, **kwargs):
+        response = getattr(requests, method)(url, headers=headers, **kwargs)
+        response.raise_for_status()
+        return response.json() if response.text else None
 
-        # Connect to vCenter
-        service_instance = SmartConnect(
-            host=vcenter_host,
-            user=vcenter_user,
-            pwd=vcenter_password,
-            sslContext=context
-        )
-        if not service_instance:
-            module.fail_json(msg='Unable to connect to vCenter')
+    def get_vcenter_session(self):
+        url = f"https://{self.hostname}/api/session"
+        response = requests.post(url, auth=(self.username, self.password), verify=self.validate_certs)
+        response.raise_for_status()
+        return response.json()
 
-        # Get source and destination libraries
-        source_library = get_content_library_by_name(service_instance, source_library_name)
-        if not source_library:
-            module.fail_json(msg=f'Source library "{source_library_name}" not found')
-        destination_library = get_content_library_by_name(service_instance, destination_library_name)
-        if not destination_library:
-            module.fail_json(msg=f'Destination library "{destination_library_name}" not found')
+    def get_vm_id(self):
+        url = f"https://{self.hostname}/api/vcenter/vm?names={self.vm_name}"
+        headers = {'vmware-api-session-id': self.session}
+        data = self.api_call(url, headers=headers, verify=self.validate_certs)
+        return data[0]['vm'] if data else None
 
-        # Get items from source library
-        items = source_library.item
+    def get_lib_id(self):
+        url = f"https://{self.hostname}/api/content/library?action=find"
+        headers = {'vmware-api-session-id': self.session}
+        params = {'name': self.content_library, 'type': 'LOCAL'}
+        data = self.api_call(url, method='post', headers=headers, json=params, verify=self.validate_certs)
+        return data[0].replace('"','') if data else None
 
-        # Filter out items with annotation { "published":"false" }
-        filtered_items = [item for item in items if not is_item_published_false(item)]
+    def check_content_library_state(self):
+        lib_id = self.get_lib_id()
+        return 'present' if lib_id else 'absent'
+  
+    def check_vm_state(self):
+        lib_id = self.get_vm_id()
+        return 'present' if lib_id else 'absent'
 
-        # Add filtered items to destination library
-        for item in filtered_items:
-            add_item_to_library(service_instance, item, destination_library)
+    def add_vm_to_content_library(self):
+        vm_id = self.get_vm_id()
+        lib_id = self.get_lib_id()
 
-        # Disconnect from vCenter
-        Disconnect(service_instance)
+        url = f"https://{self.hostname}/api/vcenter/ovf/library-item"
+        headers = {
+            'vmware-api-session-id': self.session,
+            'Content-Type': 'application/json'
+        }
+        payload = {
+            "create_spec": {
+                "name": f"{self.vm_name}_{str(int(time.time()))}"
+            },
+            "source": {
+                "id": vm_id,
+                "type": "VirtualMachine"
+            },
+            "target": {
+                "library_id": lib_id
+            }
+        }
+        response = self.api_call(url, method='post', headers=headers, json=payload, verify=self.validate_certs)
+        if not response or response.get('succeeded') is False:
+            self.module.fail_json(msg=f"Failed to add VM: {self.vm_name} to Content Library: {self.content_library}.")
+        
+        self.remove_excess_templates(lib_id=lib_id)
+        self.publish_template(lib_id=lib_id)
 
-        module.exit_json(changed=True, msg=f'Added items from "{source_library_name}" to "{destination_library_name}"')
-    except Exception as e:
-        module.fail_json(msg=str(e))
+    def get_all_template_ids(self, lib_id):
+        url = f"https://{self.hostname}/api/content/library/item?library_id={lib_id}"
+        headers = {'vmware-api-session-id': self.session}
+        data = self.api_call(url, method='get', headers=headers, verify=self.validate_certs)
+        if data:
+            templates = []
+            for item in data:
+                if item:
+                    template_id = item.replace('"', '')
+                    template_name = self.get_template_name(template_id)
+                    template_notes = self.get_template_notes(template_id)
+                    vm_name = template_name.split('_')[0] if '_' in template_name else template_name
+                    templates.append((template_id, vm_name, template_name, template_notes))
+            return templates
+        else:
+            return None
+            
+    def publish_template(self, lib_id):
+        template_data = self.get_all_template_ids(lib_id)
+        if template_data:
+            templates_by_vm = defaultdict(list)
+            for template_id, vm_name, template_name, template_notes in template_data:
+                templates_by_vm[vm_name].append((template_id, template_name, template_notes))
+            for vm_name, templates in templates_by_vm.items():
+                templates.sort(key=lambda x: x[1], reverse=True)
+                for template_id, template_name, template_notes in templates:
+                    if vm_name == self.vm_name:  # Only update notes if VM names match
+                        if template_notes:
+                            notes=json.loads(template_notes.replace("'",'"'))
+                            if notes['published'] and notes['published'] == 'False':
+                                notes['published'] = 'True'
+                            elif notes['published'] and notes['published'] == 'True':
+                                notes['published'] = 'Retired'
+                            url = f"https://{self.hostname}/api/content/library/item/{template_id}"
+                            headers = {'vmware-api-session-id': self.session}
+                            payload = { 'description': f'{notes}' }
+                            response = requests.patch(url, headers=headers, json=payload, verify=self.validate_certs)
+                            if response.status_code != 204:
+                                self.module.fail_json(msg=f"Failed to update published status of template: {template_name} with ID: {template_id}")
 
+    def get_template_name(self, template_id):
+        url = f"https://{self.hostname}/api/content/library/item/{template_id}"
+        headers = {'vmware-api-session-id': self.session}
+        data = self.api_call(url, headers=headers, verify=self.validate_certs)
+        return data.get('name', '') if data else ''
+        
+    def get_template_notes(self, template_id):
+        url = f"https://{self.hostname}/api/content/library/item/{template_id}"
+        headers = {'vmware-api-session-id': self.session}
+        data = self.api_call(url, headers=headers, verify=self.validate_certs)
+        return data.get('description', '') if data else ''
 
-def create_ssl_context():
-    # Create a custom SSLContext with check_hostname set to False
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    return context
+    def remove_excess_templates(self, lib_id):
+        template_data = self.get_all_template_ids(lib_id)
+        if template_data:
+            templates_by_vm = defaultdict(list)
+            for template_id, vm_name, template_name, template_notes in template_data:
+                templates_by_vm[vm_name].append((template_id, template_name))
+            for vm_name, templates in templates_by_vm.items():
+                templates.sort(key=lambda x: x[1], reverse=True)
+                if len(templates) > 2:
+                    for template_id, template_name in templates[2:]:
+                        url = f"https://{self.hostname}/api/content/library/item/{template_id}"
+                        headers = {'vmware-api-session-id': self.session}
+                        response = requests.delete(url, headers=headers, verify=self.validate_certs)
+                        if response.status_code != 204:
+                            self.module.fail_json(msg=f"Failed to delete template with ID: {template_id}")
 
-
-def get_content_library_by_name(service_instance, library_name):
-    content_manager = service_instance.content.rootFolder.childEntity
-    for entity in content_manager:
-        if isinstance(entity, vim.ContentLibrary) and entity.name == library_name:
-            return entity
-    return None
-
-
-def is_item_published_false(item):
-    annotations = item.GetAnnotation()
-    for annotation in annotations:
-        if annotation.key == 'published' and annotation.value == 'false':
-            return True
-    return False
-
-
-def add_item_to_library(service_instance, item, library):
-    try:
-        library_item = library.AddLibraryItem(name=item.GetName(), item=item)
-        library_item.Update()
-    except Exception as e:
-        raise Exception(f'Failed to add item "{item.GetName()}" to library: {str(e)}')
+    def process_state(self):
+        if self.check_content_library_state() == 'absent':
+            self.module.fail_json(msg=f"Content Library '{self.content_library}' does not exist.")
+        if self.check_vm_state() == 'absent':
+            self.module.fail_json(msg=f"Virtual Machine Source '{self.vm_name}' does not exist")
+        self.add_vm_to_content_library()
 
 
 def main():
-    module_args = dict(
-        source_library_name=dict(type='str', required=True),
-        destination_library_name=dict(type='str', required=True),
-        vcenter_host=dict(type='str', required=True),
-        vcenter_user=dict(type='str', required=True),
-        vcenter_password=dict(type='str', required=True, no_log=True),
-        validate_certs=dict(type='bool', required=False, default=True)
+    module = AnsibleModule(
+        argument_spec=dict(
+            hostname=dict(type='str', required=True),
+            content_library=dict(type='str', required=True),
+            vm_name=dict(type='str', required=True),
+            validate_certs=dict(type='bool', default=True),
+            username=dict(type='str', required=True),
+            password=dict(type='str', required=True, no_log=True),
+            esxi_host=dict(type='str', required=True),
+            vm_notes=dict(type='str', default=''),
+            port=dict(type='int', default=443)
+        ),
     )
 
-    module = AnsibleModule(argument_spec=module_args, supports_check_mode=True)
-
-    if module.check_mode:
-        module.exit_json(changed=False)
-
-    add_content_library(module)
+    vmware_content_library_manager = VMwareContentLibraryManager(module)
+    vmware_content_library_manager.process_state()
+    module.exit_json(changed=False)
 
 
 if __name__ == '__main__':
