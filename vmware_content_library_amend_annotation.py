@@ -77,18 +77,23 @@ class VMwareContentLibraryManager(VmwareRestClient):
         template_data = self.get_all_template_ids(lib_id)
         retired_prefixes = set()  # To store prefixes of retired templates
         templates_to_update = []  # To store templates that need to be updated
+        found_false_published = False  # To track if 'Published: False' exists
         if template_data:
             for template_id, vm_name, _, template_notes in template_data:
                 if template_notes:
                     notes = json.loads(template_notes.replace("'",'"'))
                     if 'published' in notes:
                         if notes['published'] == 'False':
+                            found_false_published = True  # Found 'Published: False'
                             notes['published'] = 'True'
                             templates_to_update.append((template_id, notes))
-                        elif notes['published'] == 'True':
-                            if vm_name not in retired_prefixes:
-                                notes['published'] = 'Retired'
-                                templates_to_update.append((template_id, notes))
+            if found_false_published:
+                for template_id, vm_name, _, template_notes in template_data:
+                    if template_notes:
+                        notes = json.loads(template_notes.replace("'",'"'))
+                        if 'published' in notes and notes['published'] == 'True':
+                            notes['published'] = 'Retired'
+                            templates_to_update.append((template_id, notes))
                         elif notes['published'] == 'Retired':
                             retired_prefixes.add(vm_name)  # Add prefix of retired template
         return templates_to_update
