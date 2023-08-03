@@ -31,6 +31,10 @@ class VMwareContentLibraryManager(VmwareRestClient):
         self.source_prefix_count = defaultdict(int)
         self.destination_prefix_count = defaultdict(int)
 
+        # Initializing the count variables for source and destination OS versions
+        self.source_os_version_count = defaultdict(int)
+        self.destination_os_version_count = defaultdict(int)
+
     def api_call(self, url, method='get', headers=None, **kwargs):
         response = getattr(requests, method)(url, headers=headers, **kwargs)
         response.raise_for_status()
@@ -65,6 +69,12 @@ class VMwareContentLibraryManager(VmwareRestClient):
     def check_content_library_state(self, library_id):
         return 'present' if library_id else 'absent'
 
+    def remove_unpublished_templates(self, library_id):
+        templates = self.get_all_template_ids(library_id)
+        for template_id, _, _, template_notes in templates:
+            if self.check_template_published(template_notes) == 'False':
+                self.delete_template_from_library(template_id, library_id)
+
     def get_all_template_ids(self, library_id):
         url = f"https://{self.hostname}/api/content/library/item?library_id={library_id}"
         headers = {'vmware-api-session-id': self.session}
@@ -76,44 +86,29 @@ class VMwareContentLibraryManager(VmwareRestClient):
                     template_id = item.replace('"', '')
                     template_name = self.get_template_attr(template_id, 'name')
                     template_notes = self.get_template_attr(template_id, 'description')
-                    vm_name = template_name.split('_')[0] if '_' in template_name else template_name
-                    templates.append((template_id, vm_name, template_name, template_notes))
-        return templates  # Return an empty list if no templates
+                    operating_system_version = None
+                    if template_notes:
+                        notes = json.loads(template_notes.replace("'", '"'))
+                        operating_system_version = notes.get('operatingSystemVersion', None)
+                    templates.append((template_id, operating_system_version, template_name, template_notes))
+        return templates
 
-    def remove_unpublished_templates(self, library_id):
-        templates = self.get_all_template_ids(library_id)
-        for template_id, _, _, template_notes in templates:
-            if not self.check_template_published(template_notes):
-                self.delete_template_from_library(template_id, library_id)
+    def check_template_published(self, template_notes):
+        if template_notes:
+            notes = json.loads(template_notes.replace("'", '"'))
+            return notes.get('published', 'False')
+        return 'False'
 
     def copy_templates_to_library(self, source_library_id, destination_library_id):
         source_templates = self.get_all_template_ids(source_library_id)
         destination_templates = self.get_all_template_ids(destination_library_id)
 
-        # Update the prefix count for source and destination libraries
-        for _, vm_prefix, _, _ in source_templates:
-            self.source_prefix_count[vm_prefix] += 1
-        for _, vm_prefix, _, _ in destination_templates:
-            self.destination_prefix_count[vm_prefix] += 1
-
         if source_templates:
-            for template_id, vm_prefix, template_name, template_notes in source_templates:
-                if self.check_template_published(template_notes):
-                    # Check the number of templates with the same prefix in the destination library
-                    if self.destination_prefix_count[vm_prefix] < 2:
-                        if not any(d_template_name == template_name for _, _, d_template_name, _ in destination_templates):
-                            self.copy_template_to_library(template_id, template_name, destination_library_id)
-
-        self.delete_excess_templates(destination_library_id)
-
-    def check_template_published(self, template_notes):
-        if template_notes:
-            notes = json.loads(template_notes.replace("'", '"'))
-            published_status = notes.get('published', False)
-            if isinstance(published_status, str):
-                return published_status not in ['False', 'Retired']
-            return published_status
-        return False
+            for template_id, os_version, template_name, template_notes in source_templates:
+                published_status = self.check_template_published(template_notes)
+                if published_status == 'True':  # Only copy templates with 'True' status
+                    if not any(d_template_name == template_name for _, _, d_template_name, _ in destination_templates):
+                        self.copy_template_to_library(template_id, template_name, destination_library_id)
 
     def check_template_exists(self, template_id):
         url = f"https://{self.hostname}/api/content/library/item/{template_id}"
@@ -149,54 +144,83 @@ class VMwareContentLibraryManager(VmwareRestClient):
         else:
             return response_text
 
-    def delete_excess_templates(self, destination_library_id):
-        destination_templates = self.get_all_template_ids(destination_library_id)
-
-        # Deleting excess templates
-        for template_id, vm_prefix, _, template_notes in destination_templates:
-            if self.destination_prefix_count[vm_prefix] > 2 and not self.check_template_published(template_notes):
-                self.delete_template_from_library(template_id, destination_library_id)
-                self.destination_prefix_count[vm_prefix] -= 1
-                self.module.fail_json(msg=f"Got to end of delete excess templates bit")
-
     def delete_template_from_library(self, template_id, library_id):
         url = f"https://{self.hostname}/api/content/library/item/{template_id}"
         headers = {'vmware-api-session-id': self.session}
         response = requests.delete(url, headers=headers, verify=self.validate_certs)
         if response.status_code != 204:
-            self.module.fail_json(msg=f"Deleting template from library failed.")
+            self.module.fail_json(msg="Failed to delete template.")
+            
+    def remove_excess_templates(self, library_id):
+        # Getting all templates
+        templates = self.get_all_template_ids(library_id)
 
-    def manage_content_libraries(self):
+        # Grouping templates by operatingSystemVersion
+        os_version_templates = defaultdict(lambda: {'True': [], 'False': [], 'Retired': []})
+        for template in templates:
+            template_id, os_version, _, template_notes = template
+            if os_version:
+                notes = json.loads(template_notes.replace("'", '"'))
+                published_status = notes.get('published', 'False')
+                os_version_templates[os_version][published_status].append(template_id)
+
+        # Processing each OS version group
+        for _, template_lists in os_version_templates.items():
+            # Keep the latest 'True' template and remove the others
+            for template_id in template_lists['True'][:-1]:
+                self.delete_template_from_library(template_id, library_id)
+
+            # Keep only the latest 'False' template and remove the others
+            for template_id in template_lists['False'][:-1]:
+                self.delete_template_from_library(template_id, library_id)
+
+            # Remove all 'Retired' templates only if there is at least one 'False' template
+            if template_lists['False']:
+                for template_id in template_lists['Retired']:
+                    self.delete_template_from_library(template_id, library_id)
+
+
+    def main(self):
+        """Main entry point of the module."""
         source_library_id = self.get_source_library_id()
+        source_library_state = self.check_content_library_state(source_library_id)
+
         destination_library_id = self.get_destination_library_id()
-        if not source_library_id or not destination_library_id:
-            self.module.fail_json(msg="Either source or destination library not found.")
+        destination_library_state = self.check_content_library_state(destination_library_id)
+
+        if source_library_state == 'absent':
+            self.module.fail_json(msg="Source library not found.")
+        elif destination_library_state == 'absent':
+            self.module.fail_json(msg="Destination library not found.")
         else:
-            self.remove_unpublished_templates(destination_library_id)  # Call before copying templates
+            self.remove_unpublished_templates(destination_library_id)
             self.copy_templates_to_library(source_library_id, destination_library_id)
-            self.delete_excess_templates(destination_library_id)
+            self.remove_excess_templates(destination_library_id)
 
-        self.module.exit_json(changed=True, msg="Library management succeeded")
-
+            self.module.exit_json(
+                msg="Templates copied successfully.",
+                source_library=self.source_library,
+                destination_library=self.destination_library,
+            )
 
 
 def main():
     argument_spec = VmwareRestClient.vmware_client_argument_spec()
     argument_spec.update(
         hostname=dict(type='str', required=True),
-        port=dict(type='int', default=443),
         username=dict(type='str', required=True),
         password=dict(type='str', required=True, no_log=True),
-        validate_certs=dict(type='bool', default=False),
+        port=dict(type='int', default=443),
         source_library=dict(type='str', required=True),
-        destination_library=dict(type='str', required=True)
+        destination_library=dict(type='str', required=True),
+        validate_certs=dict(type='bool', default=False)
     )
 
     module = AnsibleModule(argument_spec=argument_spec)
-    vmware_content_library_manager = VMwareContentLibraryManager(module)
 
-    vmware_content_library_manager.manage_content_libraries()
+    vmware_content_lib_mgr = VMwareContentLibraryManager(module)
+    vmware_content_lib_mgr.main()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
