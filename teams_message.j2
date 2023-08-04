@@ -1,0 +1,15 @@
+{
+  "@type": "MessageCard",
+  "@context": "http://schema.org/extensions",
+  "summary": "Ansible Notification",
+  "themeColor": "0076D7",
+  "sections": [{
+    "activityTitle": "Ansible Task Notification",
+    "activitySubtitle": "{{ task_name }}",
+    "facts": [
+      { "name": "Status", "value": "{{ status }}" },
+      { "name": "Host", "value": "{{ host }}" }
+    ],
+    "markdown": true
+  }]
+}
