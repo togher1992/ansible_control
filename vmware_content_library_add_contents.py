@@ -26,6 +26,7 @@ class VMwareContentLibraryManager(VmwareRestClient):
         self.esxi_host = self.params.get('esxi_host')
         self.vm_notes = self.params.get('vm_notes')
         self.port = self.params.get('port')
+        self.new_template_name = self.params.get('new_template_name')
 
         # Session management
         self.session = self.get_vcenter_session()
@@ -36,23 +37,23 @@ class VMwareContentLibraryManager(VmwareRestClient):
         return response.json() if response.text else None
 
     def get_vcenter_session(self):
-        url = f"https://{self.hostname}/api/session"
+        url = f"https://{self.hostname}/rest/com/vmware/cis/session"
         response = requests.post(url, auth=(self.username, self.password), verify=self.validate_certs)
         response.raise_for_status()
         return response.json()
 
     def get_vm_id(self):
-        url = f"https://{self.hostname}/api/vcenter/vm?names={self.vm_name}"
-        headers = {'vmware-api-session-id': self.session}
+        url = f"https://{self.hostname}/rest/vcenter/vm?filter.names={self.vm_name}"
+        headers = {'vmware-api-session-id': self.session['value']}
         data = self.api_call(url, headers=headers, verify=self.validate_certs)
-        return data[0]['vm'] if data else None
+        return data['value'][0]['vm'] if data else None
 
     def get_lib_id(self):
-        url = f"https://{self.hostname}/api/content/library?action=find"
-        headers = {'vmware-api-session-id': self.session}
-        params = {'name': self.content_library, 'type': 'LOCAL'}
+        url = f"https://{self.hostname}/rest/com/vmware/content/library?~action=find"
+        headers = {'vmware-api-session-id': self.session['value']}
+        params = {'spec': {'name': self.content_library, 'type': 'LOCAL'}}
         data = self.api_call(url, method='post', headers=headers, json=params, verify=self.validate_certs)
-        return data[0].replace('"','') if data else None
+        return data['value'] if data else None
 
     def check_content_library_state(self):
         lib_id = self.get_lib_id()
@@ -66,37 +67,37 @@ class VMwareContentLibraryManager(VmwareRestClient):
         vm_id = self.get_vm_id()
         lib_id = self.get_lib_id()
 
-        url = f"https://{self.hostname}/api/vcenter/ovf/library-item"
+        url = f"https://{self.hostname}/rest/com/vmware/vcenter/ovf/library-item"
         headers = {
-            'vmware-api-session-id': self.session,
+            'vmware-api-session-id': self.session['value'],
             'Content-Type': 'application/json'
         }
         payload = {
             "create_spec": {
-                "name": f"{self.vm_name}_{str(int(time.time()))}"
+                "name": f"{self.new_template_name}"
             },
             "source": {
-                "id": vm_id,
+                "id": f"{vm_id}",
                 "type": "VirtualMachine"
             },
             "target": {
-                "library_id": lib_id
+                "library_id": f"{lib_id[0]}"
             }
         }
         response = self.api_call(url, method='post', headers=headers, json=payload, verify=self.validate_certs)
         if not response or response.get('succeeded') is False:
             self.module.fail_json(msg=f"Failed to add VM: {self.vm_name} to Content Library: {self.content_library}.")
         
-        self.remove_excess_templates(lib_id=lib_id)
-        self.publish_template(lib_id=lib_id)
+        self.remove_excess_templates(lib_id=lib_id[0])
+        self.publish_template(lib_id=lib_id[0])
 
     def get_all_template_ids(self, lib_id):
-        url = f"https://{self.hostname}/api/content/library/item?library_id={lib_id}"
-        headers = {'vmware-api-session-id': self.session}
+        url = f"https://{self.hostname}/rest/com/vmware/content/library/item?library_id={lib_id}"
+        headers = {'vmware-api-session-id': self.session['value']}
         data = self.api_call(url, method='get', headers=headers, verify=self.validate_certs)
         if data:
             templates = []
-            for item in data:
+            for item in data['value']:
                 if item:
                     template_id = item.replace('"', '')
                     template_name = self.get_template_name(template_id)
@@ -123,24 +124,24 @@ class VMwareContentLibraryManager(VmwareRestClient):
                                 notes['published'] = 'True'
                             elif notes['published'] and notes['published'] == 'True':
                                 notes['published'] = 'Retired'
-                            url = f"https://{self.hostname}/api/content/library/item/{template_id}"
-                            headers = {'vmware-api-session-id': self.session}
-                            payload = { 'description': f'{notes}' }
+                            url = f"https://{self.hostname}/rest/com/vmware/content/library/item/id:{template_id}"
+                            headers = {'vmware-api-session-id': self.session['value']}
+                            payload = { 'update_spec': { 'description': f'{notes}' }}
                             response = requests.patch(url, headers=headers, json=payload, verify=self.validate_certs)
-                            if response.status_code != 204:
-                                self.module.fail_json(msg=f"Failed to update published status of template: {template_name} with ID: {template_id}")
+                            if response.status_code != 200:
+                                self.module.fail_json(msg=f"Failed to update published status of template: {template_name} with ID: {template_id[0]}")
 
     def get_template_name(self, template_id):
-        url = f"https://{self.hostname}/api/content/library/item/{template_id}"
-        headers = {'vmware-api-session-id': self.session}
+        url = f"https://{self.hostname}/rest/com/vmware/content/library/item/id:{template_id}"
+        headers = {'vmware-api-session-id': self.session['value']}
         data = self.api_call(url, headers=headers, verify=self.validate_certs)
-        return data.get('name', '') if data else ''
+        return data['value'].get('name', '') if data else ''
         
     def get_template_notes(self, template_id):
-        url = f"https://{self.hostname}/api/content/library/item/{template_id}"
-        headers = {'vmware-api-session-id': self.session}
+        url = f"https://{self.hostname}/rest/com/vmware/content/library/item/id:{template_id}"
+        headers = {'vmware-api-session-id': self.session['value']}
         data = self.api_call(url, headers=headers, verify=self.validate_certs)
-        return data.get('description', '') if data else ''
+        return data['value'].get('description', '') if data else ''
 
     def remove_excess_templates(self, lib_id):
         template_data = self.get_all_template_ids(lib_id)
@@ -152,10 +153,10 @@ class VMwareContentLibraryManager(VmwareRestClient):
                 templates.sort(key=lambda x: x[1], reverse=True)
                 if len(templates) > 2:
                     for template_id, template_name in templates[2:]:
-                        url = f"https://{self.hostname}/api/content/library/item/{template_id}"
-                        headers = {'vmware-api-session-id': self.session}
+                        url = f"https://{self.hostname}/rest/com/vmware/content/library/item/id:{template_id}"
+                        headers = {'vmware-api-session-id': self.session['value']}
                         response = requests.delete(url, headers=headers, verify=self.validate_certs)
-                        if response.status_code != 204:
+                        if response.status_code != 200:
                             self.module.fail_json(msg=f"Failed to delete template with ID: {template_id}")
 
     def process_state(self):
@@ -177,7 +178,8 @@ def main():
             password=dict(type='str', required=True, no_log=True),
             esxi_host=dict(type='str', required=True),
             vm_notes=dict(type='str', default=''),
-            port=dict(type='int', default=443)
+            port=dict(type='int', default=443),
+            new_template_name=dict(type='str', required=True)
         ),
     )
 
