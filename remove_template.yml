@@ -1,0 +1,89 @@
+#!/usr/bin/python
+from ansible.module_utils.basic import AnsibleModule
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+def get_token(hostname, username, password, validate_certs):
+    url = f"https://{hostname}/rest/com/vmware/cis/session"
+    response = requests.post(url, auth=(username, password), verify=validate_certs)
+    response.raise_for_status()
+    return response.json()['value']
+
+def get_content_library_id(token, module, content_library, hostname, validate_certs):
+    url = f"https://{hostname}/rest/com/vmware/content/library?~action=find"
+    headers = {'vmware-api-session-id': token }
+    params = {'spec': {'name': content_library, 'type': 'LOCAL'}}
+    data = requests.post(url, headers=headers, json=params, verify=validate_certs)
+    return data.json()['value'] if data else None
+
+def delete_template(token, module, content_library, template_name, hostname, validate_certs):
+    base_url = f"https://{hostname}/rest/com/vmware/content/library/item?~action=find"
+    headers = { "vmware-api-session-id": token}
+
+    # Get the content library ID
+    library_id = get_content_library_id(token, module, content_library, hostname, validate_certs)
+
+    # Get the template ID
+    template_params = {'spec': { 'library_id': library_id[0], 'name': template_name} }
+    template_response = requests.post(base_url, headers=headers, json=template_params, verify=validate_certs)
+    template_response.raise_for_status()
+    template_data = template_response.json().get('value', [])
+    
+    if not template_data:
+        # Template not found, return as successful but unchanged
+        return False
+
+    template_id = template_data[0]
+
+    # Delete the template
+    delete_url = f"https://{hostname}/rest/com/vmware/content/library/item/id:{template_id}"
+    delete_response = requests.delete(delete_url, headers=headers, verify=validate_certs)
+
+    if delete_response.status_code == 200:
+        return True
+    else:
+        module.fail_json(msg=f"Failed to delete template '{template_name}': {delete_response.text}")
+
+def run_module():
+    module_args = dict(
+        content_library=dict(type='str', required=True),
+        template_name=dict(type='str', required=True),
+        hostname=dict(type='str', required=True),
+        username=dict(type='str', required=True),
+        password=dict(type='str', required=True, no_log=True),
+        validate_certs=dict(type='bool', default=True),
+    )
+
+    result = dict(
+        changed=False,
+        msg='',
+    )
+
+    module = AnsibleModule(
+        argument_spec=module_args,
+        supports_check_mode=True,
+    )
+
+    token = get_token(module.params['hostname'], module.params['username'], module.params['password'], module.params['validate_certs'])
+
+    changed = delete_template(
+        token,
+        module,
+        module.params['content_library'],
+        module.params['template_name'],
+        module.params['hostname'],
+        module.params['validate_certs'],
+    )
+
+    if changed:
+        result['changed'] = True
+        result['msg'] = f"Template '{module.params['template_name']}' deleted successfully."
+    else:
+        result['msg'] = f"Template '{module.params['template_name']}' not found in content library '{module.params['content_library']}'"
+
+    module.exit_json(changed=result['changed'], msg=result['msg'], template_name=module.params['content_library'])
+
+if __name__ == '__main__':
+    run_module()
